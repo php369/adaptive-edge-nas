@@ -20,13 +20,13 @@ import torchvision.models as tvm
 
 warnings.filterwarnings('ignore')
 
-# ── Reproducibility ────────────────────────────────────────────────────────────
+# Set random seeds for reproducibility
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# ── GPU optimizations (RTX 4060 / Ampere) ─────────────────────────────────────
+# Setup GPU optimizations for RTX 4060 / Ampere
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.benchmark     = True   # fastest conv algo for fixed input sizes
@@ -44,7 +44,7 @@ if DEVICE.type == 'cuda':
     print(f'TF32   : matmul={torch.backends.cuda.matmul.allow_tf32}  '
           f'cudnn={torch.backends.cudnn.allow_tf32}')
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# Configure dataset and output paths
 BASE_DIR    = Path('.')
 DATASET_DIR = Path("/raid/home/dgxuser15/datasets/tiny-imagenet-200")
 MODELS_DIR  = BASE_DIR / 'models'
@@ -58,7 +58,7 @@ VAL_ANNOT  = VAL_DIR / 'val_annotations.txt'
 WNIDS_FILE = DATASET_DIR / 'wnids.txt'
 STATS_FILE = RESULTS_DIR / 'dataset_stats.json'
 
-# ── Normalization stats ────────────────────────────────────────────────────────
+# Load normalization stats from dataset statistics or use fallbacks
 if STATS_FILE.exists():
     with open(STATS_FILE) as _f:
         _s = json.load(_f)
@@ -69,7 +69,7 @@ else:
     STD  = (0.2770, 0.2691, 0.2821)
     warnings.warn('dataset_stats.json not found — using published reference values.')
 
-# ── Class map ──────────────────────────────────────────────────────────────────
+# Create class map and load WordNet IDs
 with open(WNIDS_FILE) as _f:
     _wnids = [l.strip() for l in _f if l.strip()]
 CLASS_MAP   = {wnid: idx for idx, wnid in enumerate(sorted(_wnids))}
@@ -77,7 +77,7 @@ NUM_CLASSES = len(CLASS_MAP)
 
 print(f'Classes : {NUM_CLASSES}  |  mean={MEAN}  |  std={STD}')
 
-# ── Transforms ─────────────────────────────────────────────────────────────────
+# Define data augmentation and transformation pipelines
 TRAIN_TRANSFORM = T.Compose([
     T.RandomCrop(64, padding=8, padding_mode='reflect'),
     T.RandomHorizontalFlip(p=0.5),
@@ -96,7 +96,7 @@ VAL_TRANSFORM = T.Compose([
 ])
 
 
-# ── Datasets ───────────────────────────────────────────────────────────────────
+# Define PyTorch dataset classes for train and validation data
 class TinyImageNetTrain(Dataset):
     def __init__(self):
         self.samples: list[tuple[Path, int]] = []
@@ -138,18 +138,21 @@ class TinyImageNetVal(Dataset):
             print(f"Skipping corrupted image: {path}")
             return self.__getitem__((idx + 1) % len(self.samples))
 
-        return TRAIN_TRANSFORM(img), label
+        return VAL_TRANSFORM(img), label
 
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# Training configuration parameters
 CFG = dict(
     batch_size      = 256, 
-    epochs          = 50,
+    epochs          = 100,
     lr              = 3e-3,
     weight_decay    = 5e-4,
     label_smoothing = 0.1,
-    mixup_alpha     = 0.3,
-    patience        = 15,
+    mixup_alpha     = 0.2,
+    cutmix_alpha    = 1.0,
+    cutmix_prob     = 0.5,     # 50% chance CutMix vs Mixup each batch
+    patience        = 25,
+    warmup_epochs   = 5,
     num_workers     = 8,
     pin_memory      = True,
     grad_clip       = 5.0,
@@ -165,7 +168,7 @@ MODELS_TO_TRAIN = ['mobilenetv2', 'shufflenetv2', 'efficientnet_b0']
 print('Config:', json.dumps(CFG, indent=2))
 print(f'DRY_RUN = {DRY_RUN}')
 
-# ── DataLoaders ────────────────────────────────────────────────────────────────
+# Initialize PyTorch DataLoaders
 train_loader = DataLoader(
     TinyImageNetTrain(),
     batch_size=CFG['batch_size'],
@@ -190,7 +193,7 @@ val_loader = DataLoader(
 print(f'Train batches : {len(train_loader)} | Val batches : {len(val_loader)}')
 
 
-# ── Model builder ──────────────────────────────────────────────────────────────
+# Define function to build model architecture
 def build_model(name: str, compile_model: bool = False) -> nn.Module:
     if name == 'mobilenetv2':
         model = tvm.mobilenet_v2(weights=None, num_classes=NUM_CLASSES)
@@ -225,19 +228,42 @@ USE_COMPILE = True #(not DRY_RUN) and hasattr(torch, 'compile')
 print(f'build_model() ready | channels_last=True | torch.compile={USE_COMPILE}')
 
 
-# ── Mixup ──────────────────────────────────────────────────────────────────────
-def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2):
-    lam   = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+# Mixup and CutMix data augmentation utilities
+def rand_bbox(size, lam):
+    """Generate random bounding box for CutMix."""
+    W, H = size[2], size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
+    cx, cy = np.random.randint(W), np.random.randint(H)
+    x1 = np.clip(cx - cut_w // 2, 0, W)
+    y1 = np.clip(cy - cut_h // 2, 0, H)
+    x2 = np.clip(cx + cut_w // 2, 0, W)
+    y2 = np.clip(cy + cut_h // 2, 0, H)
+    return x1, y1, x2, y2
+
+
+def mixup_cutmix_data(x, y, mixup_alpha=0.2, cutmix_alpha=1.0, cutmix_prob=0.5):
+    """Randomly apply either Mixup or CutMix per batch."""
     index = torch.randperm(x.size(0), device=x.device)
-    mixed = lam * x + (1 - lam) * x[index]
-    return mixed, y, y[index], lam
+    if np.random.random() < cutmix_prob and cutmix_alpha > 0:
+        # CutMix
+        lam = np.random.beta(cutmix_alpha, cutmix_alpha)
+        x1, y1, x2, y2 = rand_bbox(x.size(), lam)
+        x_mixed = x.clone()
+        x_mixed[:, :, x1:x2, y1:y2] = x[index, :, x1:x2, y1:y2]
+        lam = 1 - ((x2 - x1) * (y2 - y1) / (x.size(2) * x.size(3)))
+    else:
+        # Mixup
+        lam = np.random.beta(mixup_alpha, mixup_alpha) if mixup_alpha > 0 else 1.0
+        x_mixed = lam * x + (1 - lam) * x[index]
+    return x_mixed, y, y[index], lam
 
 
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-# ── Latency measurement ────────────────────────────────────────────────────────
+# Measure model inference latency
 @torch.no_grad()
 def measure_latency(model: nn.Module, n_runs: int = 100) -> float:
     """Median inference latency (ms) at batch=1."""
@@ -259,7 +285,7 @@ def measure_latency(model: nn.Module, n_runs: int = 100) -> float:
     return float(np.median(latencies))
 
 
-# ── Evaluation ─────────────────────────────────────────────────────────────────
+# Evaluate model on the validation dataset
 @torch.no_grad()
 def eval_epoch(model: nn.Module, loader, criterion) -> tuple[float, float, float]:
     model.eval()
@@ -281,10 +307,21 @@ def eval_epoch(model: nn.Module, loader, criterion) -> tuple[float, float, float
     return total_loss / total, correct1 / total, correct5 / total
 
 
-# ── Training loop ──────────────────────────────────────────────────────────────
+# Main training loop for all specified models
 all_metrics = []
 
 for model_name in MODELS_TO_TRAIN:
+    # Skip if checkpoint and metrics already exist (resume-friendly after partial failure)
+    ckpt_path = MODELS_DIR / f'{model_name}_best.pth'
+    json_path = RESULTS_DIR / f'baseline_{model_name}_metrics.json'
+    if ckpt_path.exists() and json_path.exists():
+        with open(json_path, 'r') as f:
+            metrics = json.load(f)
+        print(f"\n  ⏭  {model_name.upper()} — checkpoint exists "
+              f"(acc={metrics.get('best_val_acc1', 0)}%). Skipping.")
+        all_metrics.append(metrics)
+        continue
+
     print(f"\n{'='*60}\n  Training : {model_name.upper()}  |  Device: {DEVICE}\n{'='*60}")
 
     model    = build_model(model_name, compile_model=USE_COMPILE)
@@ -294,8 +331,16 @@ for model_name in MODELS_TO_TRAIN:
     criterion = nn.CrossEntropyLoss(label_smoothing=CFG['label_smoothing'])
     optimizer = optim.AdamW(model.parameters(),
                              lr=CFG['lr'], weight_decay=CFG['weight_decay'])
-    n_epochs  = DRY_EPOCHS if DRY_RUN else CFG['epochs']
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    n_epochs      = DRY_EPOCHS if DRY_RUN else CFG['epochs']
+    warmup_epochs = CFG['warmup_epochs']
+    # Cosine schedule after warmup
+    cosine_sched  = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, n_epochs - warmup_epochs), eta_min=1e-6)
+    warmup_sched  = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+    scheduler     = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched],
+        milestones=[warmup_epochs])
     scaler    = GradScaler(device=DEVICE.type)   # AMP fp16 scaler
 
     best_acc1  = 0.
@@ -306,21 +351,21 @@ for model_name in MODELS_TO_TRAIN:
         model.train()
         t0, running_loss, total = time.time(), 0., 0
 
-        print(f"\n🚀 Starting Epoch {epoch}/{n_epochs}")
-
         for batch_idx, (imgs, labels) in enumerate(train_loader):
             if DRY_RUN and batch_idx >= DRY_BATCHES:
                 break
-
-            if batch_idx % 50 == 0:
-                print(f"  [Epoch {epoch}] Batch {batch_idx}/{len(train_loader)}")
 
             # channels_last layout + non_blocking transfer for maximum GPU utilization
             imgs   = imgs.to(DEVICE, non_blocking=True,
                              memory_format=torch.channels_last)
             labels = labels.to(DEVICE, non_blocking=True)
 
-            imgs_m, y_a, y_b, lam = mixup_data(imgs, labels, CFG['mixup_alpha'])
+            imgs_m, y_a, y_b, lam = mixup_cutmix_data(
+                imgs, labels,
+                mixup_alpha=CFG['mixup_alpha'],
+                cutmix_alpha=CFG['cutmix_alpha'],
+                cutmix_prob=CFG['cutmix_prob'],
+            )
 
             optimizer.zero_grad(set_to_none=True)   # faster than zero_grad()
             with autocast(device_type=DEVICE.type):
@@ -347,7 +392,7 @@ for model_name in MODELS_TO_TRAIN:
         history['val_acc5'].append(val_acc5)
         history['lr'].append(lr_now)
 
-        print(f"  Epoch [{epoch:02d}/{n_epochs}]  "
+        print(f"Epoch [{epoch:02d}/{n_epochs}]  "
               f"TrainLoss={train_loss:.4f}  ValLoss={val_loss:.4f}  "
               f"Acc@1={val_acc1*100:.2f}%  Acc@5={val_acc5*100:.2f}%  "
               f"lr={lr_now:.5f}  t={time.time()-t0:.1f}s")
@@ -364,7 +409,7 @@ for model_name in MODELS_TO_TRAIN:
                 print(f'  Early stopping at epoch {epoch}')
                 break
 
-    # ── Per-model metrics ──────────────────────────────────────────────────────
+    # Save per-model metrics and performance stats
     if DEVICE.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(DEVICE)
     latency_ms = measure_latency(model)
@@ -395,7 +440,7 @@ for model_name in MODELS_TO_TRAIN:
     if DEVICE.type == 'cuda':
         torch.cuda.empty_cache()
 
-# ── Summary table ──────────────────────────────────────────────────────────────
+# Print summary comparison table
 print('\n✓  All models trained.')
 print(f"  {'Model':<20} {'Acc@1':>8} {'Acc@5':>8} {'Params(M)':>10} "
       f"{'Lat(ms)':>9} {'Size(MB)':>9}")
@@ -406,7 +451,7 @@ for m in all_metrics:
           f"{m['latency_ms']:>9.2f} {m['model_size_MB']:>9.1f}")
 print('─' * 80)
 
-# ── Training curves ────────────────────────────────────────────────────────────
+# Plot training curves for evaluation metrics
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 colors = ['#3498DB', '#E74C3C', '#2ECC71']
 
@@ -429,7 +474,7 @@ plt.savefig(RESULTS_DIR / 'baseline_training_curves.png', dpi=150, bbox_inches='
 plt.show()
 print('Saved → baseline_training_curves.png')
 
-# ── Comparison bar charts ──────────────────────────────────────────────────────
+# Generate comparison bar charts for accuracy, latency, and parameters
 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 names  = [m['model'] for m in all_metrics]
 clrs   = ['#3498DB', '#E74C3C', '#2ECC71'][:len(names)]

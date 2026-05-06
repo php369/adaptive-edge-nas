@@ -1,41 +1,42 @@
 [
   {
     "name": "mobilenetv2",
-    "acc1": 0.5,
-    "acc5": 2.5,
+    "acc1": 43.71,
+    "acc5": 69.27,
     "params_M": 2.48,
     "flops_M": 106.8,
-    "lat_ms": 8.16,
-    "onnx_lat_ms": -1.0,
+    "lat_ms": 7.25,
+    "onnx_lat_ms": 2.66,
     "model_size_MB": 9.7
   },
   {
     "name": "shufflenetv2",
-    "acc1": 0.5,
-    "acc5": 2.5,
+    "acc1": 38.31,
+    "acc5": 64.74,
     "params_M": 1.459,
     "flops_M": 49.7,
-    "lat_ms": 10.15,
-    "onnx_lat_ms": -1.0,
+    "lat_ms": 9.24,
+    "onnx_lat_ms": 3.96,
     "model_size_MB": 5.7
   },
   {
     "name": "efficientnet_b0",
-    "acc1": 0.5,
-    "acc5": 2.5,
+    "acc1": 47.47,
+    "acc5": 72.44,
     "params_M": 4.264,
     "flops_M": 135.8,
-    "lat_ms": 14.72,
-    "onnx_lat_ms": -1.0,
+    "lat_ms": 11.38,
+    "onnx_lat_ms": 9.28,
     "model_size_MB": 16.6
   },
   {
     "name": "NAS-Found",
-    "acc1": 0.57,
-    "acc5": 0.0,
-    "params_M": 0.0,
-    "flops_M": 0.0,
-    "lat_ms": 10.0,
-    "model_size_MB": 0.0
+    "acc1": 46.4,
+    "acc5": 71.49,
+    "params_M": 1.975,
+    "flops_M": 193.7,
+    "lat_ms": 7.99,
+    "onnx_lat_ms": 4.15,
+    "model_size_MB": 7.7
   }
 ]

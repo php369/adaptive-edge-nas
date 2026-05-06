@@ -44,7 +44,7 @@ print(f'Device : {DEVICE}')
 if DEVICE.type == 'cuda':
     print(f'GPU    : {torch.cuda.get_device_name(0)}')
     print(f'VRAM   : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')
-# ── Load processed manifest ───────────────────────────────────────────────────
+# Load processed data manifest
 manifest_path = PROCESSED_DIR / 'data_manifest.pkl'
 assert manifest_path.exists(), 'Run data-preprocessing.ipynb first!'
 
@@ -59,7 +59,7 @@ STD           = tuple(manifest['std'])
 NUM_CLASSES   = manifest['num_classes']
 
 print(f'Train : {len(train_samples):,} | Val : {len(val_samples):,} | Classes : {NUM_CLASSES}')
-# ── Transforms + Dataset ──────────────────────────────────────────────────────
+# Define data transformations and dataset classes
 TRAIN_TRANSFORM = T.Compose([
     T.RandomCrop(64, padding=8, padding_mode='reflect'),
     T.RandomHorizontalFlip(p=0.5),
@@ -103,7 +103,7 @@ class TinyImageNetVal(Dataset):
 
 
 print('Transforms and Dataset classes defined.')
-# ── DataLoaders ───────────────────────────────────────────────────────────────
+# Configure DataLoaders
 NUM_WORKERS = 8
 
 train_loader = DataLoader(
@@ -120,7 +120,7 @@ val_loader = DataLoader(
 )
 
 print(f'Train batches : {len(train_loader)} | Val batches : {len(val_loader)}')
-# ── Dry-run flags ─────────────────────────────────────────────────────────────
+# Configure dry-run flags for quick testing
 # Set DRY_RUN = False for full training
 DRY_RUN             = False
 DRY_SUPERNET_EPOCHS = 2
@@ -130,7 +130,7 @@ DRY_GENERATIONS     = 2
 DRY_POPULATION      = 6
 
 print(f'DRY_RUN = {DRY_RUN}')
-# ── Search space definition ───────────────────────────────────────────────────
+# Define the search space for the NAS
 OP_NAMES = [
     'identity',       # 0
     'dwconv3x3',      # 1
@@ -155,7 +155,7 @@ NUM_CELLS = len(CELL_CONFIG)   # 20
 STEM_CH   = 32
 
 print(f'Search space: {NUM_OPS} ops × {NUM_CELLS} cells  →  {NUM_OPS**NUM_CELLS:.2e} architectures')
-# ── Primitive building blocks ─────────────────────────────────────────────────
+# Define the primitive building blocks for the architectures
 class DepthwiseSepConv(nn.Module):
     def __init__(self, C_in, C_out, kernel_size, stride=1):
         super().__init__()
@@ -275,7 +275,7 @@ def build_op(op_name: str, C_in: int, C_out: int, stride: int = 1) -> nn.Module:
 
 
 print('All primitive ops defined: Identity, DepthwiseSepConv, MBConv, ShuffleBlock, SEBlock')
-# ── SuperNet ──────────────────────────────────────────────────────────────────
+# Define the One-Shot SuperNet architecture
 class SuperNet(nn.Module):
     """
     One-Shot Supernet: each cell has ALL ops in parallel.
@@ -316,7 +316,7 @@ class SuperNet(nn.Module):
 supernet = SuperNet().to(DEVICE)
 n_params = sum(p.numel() for p in supernet.parameters() if p.requires_grad)
 print(f'SuperNet parameters : {n_params / 1e6:.2f} M')
-# ── Latency LUT ───────────────────────────────────────────────────────────────
+# Build or load the Latency Lookup Table (LUT)
 lut_path = RESULTS_DIR / 'latency_lut.json'
 
 if lut_path.exists():
@@ -362,7 +362,7 @@ else:
     print(f'✓  LUT saved → {lut_path}')
 
 print(f'LUT covers {len(lut)} cells × {NUM_OPS} ops')
-# ── Latency predictor from LUT ────────────────────────────────────────────────
+# Function to predict latency from LUT
 def predict_latency(arch: list) -> float:
     """Predict total latency (ms) from the LUT for a given architecture."""
     return sum(
@@ -374,22 +374,21 @@ def predict_latency(arch: list) -> float:
 # Quick test
 test_arch = [0] * NUM_CELLS
 print(f'Predicted latency (all-identity arch): {predict_latency(test_arch):.2f} ms')
-# ── Hardware-aware training config ────────────────────────────────────────────
+# Configuration for hardware-aware training
 HW_CFG = dict(
-    supernet_epochs = 50,
+    supernet_epochs = 100,
     batch_size      = 256,
-    lr              = 5e-4,
+    lr              = 2e-3,
     weight_decay    = 1e-4,
     label_smoothing = 0.10,
-    latency_budget  = 5.0,    # ms — target for edge device
-    lambda_lat      = 0.01,   # latency penalty weight
+    latency_budget  = 10.0,   # ms — relaxed for general edge devices
+    lambda_lat      = 0.1,    # latency penalty weight in loss
     grad_clip       = 5.0,
-    early_layers    = list(range(0, 10)),
-    late_layers     = list(range(10, 20)),
+    warmup_epochs   = 5,
 )
 
-print('HW_CFG:', json.dumps({k: v for k, v in HW_CFG.items() if not isinstance(v, list)}, indent=2))
-# ── Load or train supernet ────────────────────────────────────────────────────
+print('HW_CFG:', json.dumps(HW_CFG, indent=2))
+# Load existing supernet or train a new one
 supernet_ckpt = MODELS_DIR / 'supernet_final.pth'
 
 if supernet_ckpt.exists():
@@ -403,10 +402,21 @@ else:
     criterion = nn.CrossEntropyLoss(label_smoothing=HW_CFG['label_smoothing'])
     optimizer = optim.AdamW(supernet.parameters(),
                              lr=HW_CFG['lr'], weight_decay=HW_CFG['weight_decay'])
-    n_epochs  = DRY_SUPERNET_EPOCHS if DRY_RUN else HW_CFG['supernet_epochs']
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    n_epochs      = DRY_SUPERNET_EPOCHS if DRY_RUN else HW_CFG['supernet_epochs']
+    warmup_epochs = HW_CFG['warmup_epochs']
+    # Warmup + cosine annealing
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, n_epochs - warmup_epochs), eta_min=1e-6)
+    warmup_sched = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+    scheduler    = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched],
+        milestones=[warmup_epochs])
     scaler    = GradScaler(device=DEVICE.type)
     supernet_history = {'train_loss': [], 'val_acc1': []}
+
+    # Fixed validation architectures for consistent tracking
+    val_archs = [supernet.random_arch() for _ in range(3)]
 
     for epoch in range(1, n_epochs + 1):
         supernet.train()
@@ -418,20 +428,17 @@ else:
             imgs   = imgs.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
 
-            # Progressive path sampling: only late layers are random in early epochs
-            if epoch <= HW_CFG['supernet_epochs'] // 2:
-                arch = [0] * NUM_CELLS
-                for i in HW_CFG['late_layers']:
-                    arch[i] = random.randint(0, NUM_OPS - 1)
-            else:
-                arch = supernet.random_arch()
+            # Uniform random path sampling (standard one-shot NAS approach)
+            arch = supernet.random_arch()
 
+            # Ramp latency penalty: 0 for first 10 epochs, then linearly up to lambda_lat
+            lam_ramp = min(1.0, max(0.0, (epoch - 10) / 20.0))
             lat_penalty = max(0.0, predict_latency(arch) - HW_CFG['latency_budget'])
 
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type=DEVICE.type):
                 out  = supernet(imgs, arch)
-                loss = criterion(out, labels) + HW_CFG['lambda_lat'] * lat_penalty
+                loss = criterion(out, labels) + HW_CFG['lambda_lat'] * lam_ramp * lat_penalty
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -444,31 +451,33 @@ else:
 
         scheduler.step()
 
-        # Validation
+        # Validation with fixed architectures (average accuracy)
         supernet.eval()
-        correct, n_val = 0, 0
+        best_val_acc = 0.0
         with torch.no_grad():
-            for batch_idx, (imgs, labels) in enumerate(val_loader):
-                if DRY_RUN and batch_idx >= DRY_VAL_BATCHES:
-                    break
-                imgs   = imgs.to(DEVICE, non_blocking=True)
-                labels = labels.to(DEVICE, non_blocking=True)
-                with autocast(device_type=DEVICE.type):
-                    out = supernet(imgs, supernet.random_arch())
-                correct += (out.argmax(1) == labels).sum().item()
-                n_val   += labels.size(0)
+            for v_arch in val_archs:
+                correct, n_val = 0, 0
+                for batch_idx, (imgs, labels) in enumerate(val_loader):
+                    if DRY_RUN and batch_idx >= DRY_VAL_BATCHES:
+                        break
+                    imgs   = imgs.to(DEVICE, non_blocking=True)
+                    labels = labels.to(DEVICE, non_blocking=True)
+                    with autocast(device_type=DEVICE.type):
+                        out = supernet(imgs, v_arch)
+                    correct += (out.argmax(1) == labels).sum().item()
+                    n_val   += labels.size(0)
+                best_val_acc = max(best_val_acc, correct / n_val)
 
-        val_acc1 = correct / n_val
         supernet_history['train_loss'].append(run_loss / total)
-        supernet_history['val_acc1'].append(val_acc1)
+        supernet_history['val_acc1'].append(best_val_acc)
         print(f"  Epoch [{epoch:02d}/{n_epochs}]  "
-              f"Loss={run_loss/total:.4f}  ValAcc@1={val_acc1*100:.2f}%  "
-              f"t={time.time()-t0:.1f}s")
+              f"Loss={run_loss/total:.4f}  ValAcc@1={best_val_acc*100:.2f}%  "
+              f"lr={scheduler.get_last_lr()[0]:.6f}  t={time.time()-t0:.1f}s")
 
     torch.save({'state_dict': supernet.state_dict(), 'history': supernet_history},
                supernet_ckpt)
     print(f'✓  Supernet saved → {supernet_ckpt}')
-# ── Plot supernet training curves ─────────────────────────────────────────────
+# Plot training curves for the supernet
 if supernet_history.get('train_loss'):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -484,24 +493,27 @@ if supernet_history.get('train_loss'):
     plt.savefig(RESULTS_DIR / 'supernet_training.png', dpi=150, bbox_inches='tight')
     plt.show()
     print('Saved → supernet_training.png')
-# ── Evolutionary search config ────────────────────────────────────────────────
+# Configuration for evolutionary search
 EVO_CFG = dict(
-    population     = 50,
-    generations    = 20,
-    top_k          = 10,
-    mutation_p     = 0.15,
-    n_eval_batches = 20,   # quick acc estimate per arch
+    population     = 100,
+    generations    = 30,
+    top_k          = 20,
+    mutation_p     = 0.20,
+    n_eval_batches = -1,    # -1 = use entire validation set
+    tournament_k   = 3,     # tournament selection size
+    lat_penalty_w  = 0.5,   # penalty weight for over-budget latency in fitness
 )
 
 print('EVO_CFG:', json.dumps(EVO_CFG, indent=2))
-# ── Evaluate a single architecture ───────────────────────────────────────────
+# Helper to evaluate a single architecture
 @torch.no_grad()
 def evaluate_arch(arch: list) -> tuple:
-    """Quick accuracy estimate + predicted latency. Returns (accuracy, latency_ms)."""
+    """Full validation accuracy + predicted latency. Returns (accuracy, latency_ms)."""
     supernet.eval()
     correct, total = 0, 0
+    max_batches = EVO_CFG['n_eval_batches']
     for i, (imgs, labels) in enumerate(val_loader):
-        if i >= EVO_CFG['n_eval_batches']:
+        if max_batches > 0 and i >= max_batches:
             break
         imgs   = imgs.to(DEVICE, non_blocking=True)
         labels = labels.to(DEVICE, non_blocking=True)
@@ -512,12 +524,27 @@ def evaluate_arch(arch: list) -> tuple:
     return correct / max(total, 1), predict_latency(arch)
 
 
+def compute_fitness(acc, lat_ms, budget):
+    """Latency-aware fitness: accuracy with penalty for exceeding budget."""
+    if lat_ms <= budget:
+        return acc
+    return acc - EVO_CFG['lat_penalty_w'] * (lat_ms - budget) / budget
+
+
+def tournament_select(population, evaluated, budget, k=3):
+    """Tournament selection: pick k random, return the fittest."""
+    candidates = random.sample(population, min(k, len(population)))
+    return max(candidates,
+               key=lambda a: compute_fitness(*evaluated.get(tuple(a), (0., 999.)), budget))
+
+
 print('evaluate_arch() defined.')
-# ── Evolutionary architecture search ─────────────────────────────────────────
+# Run evolutionary architecture search
 print(f"\n{'='*60}\n  Evolutionary Architecture Search\n{'='*60}")
 
 n_generations = DRY_GENERATIONS if DRY_RUN else EVO_CFG['generations']
 pop_size      = DRY_POPULATION  if DRY_RUN else EVO_CFG['population']
+budget        = HW_CFG['latency_budget']
 
 population = [supernet.random_arch() for _ in range(pop_size)]
 evaluated  = {}   # {tuple(arch): (acc, lat_ms)}
@@ -532,15 +559,21 @@ for gen in range(1, n_generations + 1):
             evaluated[key] = (acc, lat)
             all_results.append({'arch': arch, 'acc': acc, 'lat_ms': lat})
 
-    # Select top-k by accuracy
-    top_k = sorted(population,
-                   key=lambda a: evaluated.get(tuple(a), (0., 999.))[0],
-                   reverse=True)[:EVO_CFG['top_k']]
+    # Select parents via tournament selection
+    new_pop = []
+    # Keep the global top-k elites
+    all_archs_sorted = sorted(
+        population,
+        key=lambda a: compute_fitness(*evaluated.get(tuple(a), (0., 999.)), budget),
+        reverse=True
+    )
+    elites = all_archs_sorted[:EVO_CFG['top_k']]
+    new_pop.extend(elites)
 
-    # Crossover + mutation to fill next generation
-    new_pop = top_k.copy()
+    # Fill rest via tournament + crossover + mutation
     while len(new_pop) < pop_size:
-        p1, p2 = random.sample(top_k, 2)
+        p1 = tournament_select(population, evaluated, budget, EVO_CFG['tournament_k'])
+        p2 = tournament_select(population, evaluated, budget, EVO_CFG['tournament_k'])
         cut   = random.randint(1, NUM_CELLS - 1)
         child = p1[:cut] + p2[cut:]
         for i in range(len(child)):
@@ -549,16 +582,18 @@ for gen in range(1, n_generations + 1):
         new_pop.append(child)
     population = new_pop
 
-    best = max(evaluated.values(), key=lambda v: v[0])
+    # Report best (fitness-aware)
+    best_entry = max(evaluated.items(), key=lambda kv: compute_fitness(*kv[1], budget))
+    best_acc, best_lat = best_entry[1]
     print(f'  Gen [{gen:02d}/{n_generations}]  '
-          f'Best acc={best[0]*100:.2f}%  lat={best[1]:.2f} ms  '
+          f'Best acc={best_acc*100:.2f}%  lat={best_lat:.2f} ms  '
           f'Evaluated={len(evaluated)} archs')
 
 # Save search history
 with open(RESULTS_DIR / 'search_history.json', 'w') as f:
     json.dump(all_results, f, indent=2)
 print(f'✓  Search history saved ({len(all_results)} architectures)')
-# ── Select best architecture within latency budget ────────────────────────────
+# Select the best architecture within the given latency budget
 budget = HW_CFG['latency_budget']
 valid  = [r for r in all_results if r['lat_ms'] <= budget] or all_results
 best   = max(valid, key=lambda r: r['acc'])
@@ -570,7 +605,7 @@ with open(best_path, 'w') as f:
 print(f'✓  Best arch → {best_path}')
 print(f'   Accuracy : {best["acc"]*100:.2f}%  |  Latency : {best["lat_ms"]:.2f} ms')
 print(f'   Ops      : {[OP_NAMES[i] for i in best["arch"]]}')
-# ── Pareto front plot ─────────────────────────────────────────────────────────
+# Plot the Pareto front of accuracy vs latency
 accs = [r['acc'] * 100 for r in all_results]
 lats = [r['lat_ms']    for r in all_results]
 

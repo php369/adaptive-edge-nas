@@ -1,8 +1,0 @@
-{
-  "batch_size": 256,
-  "num_workers": 8,
-  "n_batches": 20,
-  "total_images": 5120,
-  "elapsed_sec": 0.559,
-  "throughput_img_s": 9164.3
-}

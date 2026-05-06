@@ -1,9 +1,7 @@
 """
-=============================================================================
- Phase 1 — Dataset Understanding & Exploratory Data Analysis (EDA)
- Project  : Hardware-Aware NAS for Edge Devices
- Dataset  : Tiny-ImageNet-200
-=============================================================================
+Phase 1: Dataset Understanding & Exploratory Data Analysis (EDA)
+Project: Hardware-Aware NAS for Edge Devices
+Dataset: Tiny-ImageNet-200
 """
 
 import json
@@ -20,9 +18,7 @@ from PIL import Image
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────────────
+# Project configuration and directory setup
 BASE_DIR    = Path(__file__).parent.parent   # project root (one level above scripts/)
 DATASET_DIR = Path("/raid/home/dgxuser15/datasets/tiny-imagenet-200")
 RESULTS_DIR = BASE_DIR / "results"
@@ -39,9 +35,7 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Load metadata
-# ─────────────────────────────────────────────────────────────────────────────
+# Load WordNet IDs and metadata
 if __name__ == "__main__":
     word_map = {}
     with open(WORDS_FILE, encoding="utf-8") as f:
@@ -53,9 +47,7 @@ if __name__ == "__main__":
     with open(WNIDS_FILE) as f:
         wnids = [l.strip() for l in f if l.strip()]
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Collect image paths
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Collect image paths for training and validation sets
     train_data: dict[str, list[Path]] = {}
     for cls_dir in sorted(TRAIN_DIR.iterdir()):
         if not cls_dir.is_dir():
@@ -73,9 +65,7 @@ if __name__ == "__main__":
 
     test_imgs = list((TEST_DIR / "images").glob("*.JPEG"))
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # STEP 1 — Integrity Check
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Step 1: Perform integrity check to ensure dataset is complete
     stats = {}
 
     train_classes = list(train_data.keys())
@@ -108,7 +98,7 @@ if __name__ == "__main__":
     })
     print(f"Val: {stats['val_total_images']:,} images | Test: {len(test_imgs):,} images (unlabelled)")
 
-    # Corrupt image check (sampled)
+    # Check for corrupt images in a sample set
     all_train_paths = [p for paths in train_data.values() for p in paths]
     sample_check    = random.sample(all_train_paths, min(2000, len(all_train_paths)))
     corrupt = []
@@ -123,9 +113,7 @@ if __name__ == "__main__":
     print(f"Corruption check ({len(sample_check):,}-image sample): "
           f"{'0 corrupt ✓' if not corrupt else f'{len(corrupt)} corrupt'}")
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # STEP 2A — Image size distribution
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Step 2A: Sample image size distribution
     size_sample = random.sample(all_train_paths, min(1000, len(all_train_paths)))
     sizes = Counter()
     for p in size_sample:
@@ -135,9 +123,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # STEP 2B — Class distribution chart
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Step 2B: Generate class distribution chart
     wnids_sorted = sorted(train_data.keys(), key=lambda k: -len(train_data[k]))
     bar_counts   = [len(train_data[w]) for w in wnids_sorted]
 
@@ -160,9 +146,7 @@ if __name__ == "__main__":
     plt.savefig(RESULTS_DIR / "class_distribution.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # STEP 2C — Pixel intensity histogram & RGB stats
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Step 2C: Calculate pixel intensity histogram and RGB stats
     print("Computing RGB statistics (5 000-image sample) …")
 
     rgb_sample = random.sample(all_train_paths, min(5000, len(all_train_paths)))
@@ -203,9 +187,7 @@ if __name__ == "__main__":
     plt.savefig(RESULTS_DIR / "pixel_intensity_hist.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # STEP 2D — Random 10×10 sample grid
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Step 2D: Generate random 10x10 sample grid of images
     fig, axes = plt.subplots(10, 10, figsize=(20, 20),
                               gridspec_kw={"hspace": 0.05, "wspace": 0.05})
     for ax, path in zip(axes.ravel(), random.sample(all_train_paths, 100)):
@@ -216,9 +198,7 @@ if __name__ == "__main__":
     plt.savefig(RESULTS_DIR / "sample_grid.png", dpi=120, bbox_inches="tight")
     plt.close()
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # STEP 2E — Per-class sample strip (200 classes, 20×10 grid)
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Step 2E: Generate per-class sample strip (200 classes in a 20x10 grid)
     fig, axes = plt.subplots(10, 20, figsize=(40, 20),
                               gridspec_kw={"hspace": 0.6, "wspace": 0.05})
     for ax, wnid in zip(axes.ravel(), sorted(train_data.keys())):
@@ -232,9 +212,7 @@ if __name__ == "__main__":
     plt.savefig(RESULTS_DIR / "per_class_samples.png", dpi=100, bbox_inches="tight")
     plt.close()
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Persist statistics
-    # ─────────────────────────────────────────────────────────────────────────────
+    # Persist the collected statistics to JSON
     stats["rgb_mean"]          = [round(m, 6) for m in means]
     stats["rgb_std"]           = [round(s, 6) for s in stds]
     stats["expected_mean_ref"] = [0.480, 0.448, 0.398]

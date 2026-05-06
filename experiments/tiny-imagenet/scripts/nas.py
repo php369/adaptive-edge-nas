@@ -43,7 +43,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 print(f'Device : {DEVICE}')
 if DEVICE.type == 'cuda':
     print(f'GPU    : {torch.cuda.get_device_name(0)}')
-# ── Load manifest + best arch ─────────────────────────────────────────────────
+# Load manifest and best architecture configuration
 manifest_path = PROCESSED_DIR / 'data_manifest.pkl'
 assert manifest_path.exists(), 'Run data-preprocessing.ipynb first!'
 
@@ -65,7 +65,7 @@ ARCH = best['arch']   # list of int op indices, length = NUM_CELLS
 
 print(f'Train : {len(train_samples):,} | Val : {len(val_samples):,} | Classes : {NUM_CLASSES}')
 print(f'Arch  : {ARCH}')
-# ── Transforms + Datasets ─────────────────────────────────────────────────────
+# Define transforms and datasets
 TRAIN_TRANSFORM = T.Compose([
     T.RandomCrop(64, padding=8, padding_mode='reflect'),
     T.RandomHorizontalFlip(p=0.5),
@@ -124,7 +124,7 @@ val_loader = DataLoader(
 )
 
 print(f'Train batches : {len(train_loader)} | Val batches : {len(val_loader)}')
-# ── Search-space primitives (needed to build StandaloneNASModel) ──────────────
+# Define search-space primitives required for StandaloneNASModel
 OP_NAMES = [
     'identity', 'dwconv3x3', 'dwconv5x5',
     'mbconv3x3', 'mbconv5x5', 'shuffle_block', 'se_block',
@@ -265,7 +265,7 @@ def build_op(op_name: str, C_in: int, C_out: int, stride: int = 1) -> nn.Module:
 
 
 print('All primitive ops defined.')
-# ── Standalone NAS model ──────────────────────────────────────────────────────
+# Build Standalone NAS model
 class StandaloneNASModel(nn.Module):
     """
     Instantiate the best-found architecture as a single static net.
@@ -295,19 +295,32 @@ class StandaloneNASModel(nn.Module):
         return self.head(self.cells(self.stem(x)))
 
 
-model    = StandaloneNASModel(ARCH).to(DEVICE)
+model = StandaloneNASModel(ARCH).to(DEVICE)
+model = model.to(memory_format=torch.channels_last)
+
+# torch.compile for faster training
+if hasattr(torch, 'compile'):
+    try:
+        model = torch.compile(model, mode='reduce-overhead')
+        print('[compile] torch.compile() applied to NAS model')
+    except Exception as e:
+        print(f'[compile] torch.compile() skipped: {e}')
+
 n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f'StandaloneNASModel built — {n_params / 1e6:.2f} M parameters')
 print(f'Ops: {[OP_NAMES[i] for i in ARCH]}')
-# ── Fine-tune config ──────────────────────────────────────────────────────────
+# Set fine-tuning configuration parameters
 FT_CFG = dict(
-    epochs       = 50,          # more epochs since we're training from scratch
-    lr           = 1e-3,
-    weight_decay = 1e-4,
-    label_smooth = 0.10,
-    mixup_alpha  = 0.20,
-    patience     = 12,
-    grad_clip    = 5.0,
+    epochs        = 100,
+    lr            = 3e-3,
+    weight_decay  = 5e-4,
+    label_smooth  = 0.10,
+    mixup_alpha   = 0.2,
+    cutmix_alpha  = 1.0,
+    cutmix_prob   = 0.5,
+    patience      = 25,
+    warmup_epochs = 5,
+    grad_clip     = 5.0,
 )
 
 # Set DRY_RUN = False for full fine-tuning
@@ -318,13 +331,46 @@ DRY_VAL_BATCHES = 5
 
 print('FT_CFG:', json.dumps(FT_CFG, indent=2))
 print(f'DRY_RUN = {DRY_RUN}')
-# ── Fine-tuning loop ──────────────────────────────────────────────────────────
-n_epochs  = DRY_EPOCHS if DRY_RUN else FT_CFG['epochs']
+
+
+# Mixup and CutMix utility functions
+def rand_bbox(size, lam):
+    W, H = size[2], size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
+    cx, cy = np.random.randint(W), np.random.randint(H)
+    x1 = np.clip(cx - cut_w // 2, 0, W)
+    y1 = np.clip(cy - cut_h // 2, 0, H)
+    x2 = np.clip(cx + cut_w // 2, 0, W)
+    y2 = np.clip(cy + cut_h // 2, 0, H)
+    return x1, y1, x2, y2
+
+
+def mixup_cutmix_data(x, y, mixup_alpha=0.2, cutmix_alpha=1.0, cutmix_prob=0.5):
+    index = torch.randperm(x.size(0), device=x.device)
+    if np.random.random() < cutmix_prob and cutmix_alpha > 0:
+        lam = np.random.beta(cutmix_alpha, cutmix_alpha)
+        x1, y1, x2, y2 = rand_bbox(x.size(), lam)
+        x_mixed = x.clone()
+        x_mixed[:, :, x1:x2, y1:y2] = x[index, :, x1:x2, y1:y2]
+        lam = 1 - ((x2 - x1) * (y2 - y1) / (x.size(2) * x.size(3)))
+    else:
+        lam = np.random.beta(mixup_alpha, mixup_alpha) if mixup_alpha > 0 else 1.0
+        x_mixed = lam * x + (1 - lam) * x[index]
+    return x_mixed, y, y[index], lam
+# Start the fine-tuning training loop
+n_epochs      = DRY_EPOCHS if DRY_RUN else FT_CFG['epochs']
+warmup_epochs = FT_CFG['warmup_epochs']
 criterion = nn.CrossEntropyLoss(label_smoothing=FT_CFG['label_smooth'])
 optimizer = optim.AdamW(model.parameters(),
                          lr=FT_CFG['lr'], weight_decay=FT_CFG['weight_decay'])
-scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, T_max=n_epochs, eta_min=1e-6)
+cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=max(1, n_epochs - warmup_epochs), eta_min=1e-6)
+warmup_sched = optim.lr_scheduler.LinearLR(
+    optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+scheduler    = optim.lr_scheduler.SequentialLR(
+    optimizer, schedulers=[warmup_sched, cosine_sched],
+    milestones=[warmup_epochs])
 scaler    = GradScaler(device=DEVICE.type)
 
 best_acc1  = 0.
@@ -338,15 +384,17 @@ for epoch in range(1, n_epochs + 1):
     for batch_idx, (imgs, labels) in enumerate(train_loader):
         if DRY_RUN and batch_idx >= DRY_BATCHES:
             break
-        imgs   = imgs.to(DEVICE, non_blocking=True)
+        imgs   = imgs.to(DEVICE, non_blocking=True,
+                         memory_format=torch.channels_last)
         labels = labels.to(DEVICE, non_blocking=True)
 
-        # Mixup
-        alpha = FT_CFG['mixup_alpha']
-        lam   = np.random.beta(alpha, alpha) if alpha > 0 else 1.
-        idx   = torch.randperm(imgs.size(0), device=imgs.device)
-        imgs_m = lam * imgs + (1 - lam) * imgs[idx]
-        y_a, y_b = labels, labels[idx]
+        # CutMix / Mixup
+        imgs_m, y_a, y_b, lam = mixup_cutmix_data(
+            imgs, labels,
+            mixup_alpha=FT_CFG['mixup_alpha'],
+            cutmix_alpha=FT_CFG['cutmix_alpha'],
+            cutmix_prob=FT_CFG['cutmix_prob'],
+        )
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=DEVICE.type):
@@ -371,7 +419,8 @@ for epoch in range(1, n_epochs + 1):
         for batch_idx, (imgs, labels) in enumerate(val_loader):
             if DRY_RUN and batch_idx >= DRY_VAL_BATCHES:
                 break
-            imgs   = imgs.to(DEVICE, non_blocking=True)
+            imgs   = imgs.to(DEVICE, non_blocking=True,
+                             memory_format=torch.channels_last)
             labels = labels.to(DEVICE, non_blocking=True)
             with autocast(device_type=DEVICE.type):
                 out = model(imgs)
@@ -412,7 +461,7 @@ for epoch in range(1, n_epochs + 1):
 
 print(f'\nBest val Acc@1 : {best_acc1*100:.2f}%')
 print(f'Saved → {MODELS_DIR / "nas_best_finetuned.pth"}')
-# ── Training curves ───────────────────────────────────────────────────────────
+# Plot the training curves
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
 axes[0].plot(history['train_loss'], color='#3498DB', lw=2)
@@ -432,7 +481,7 @@ plt.tight_layout()
 plt.savefig(RESULTS_DIR / 'nas_finetuning_curves.png', dpi=150, bbox_inches='tight')
 plt.show()
 print('Saved → nas_finetuning_curves.png')
-# ── Latency benchmark ─────────────────────────────────────────────────────────
+# Perform latency benchmark for the fine-tuned model
 model.eval()
 dummy = torch.randn(1, 3, 64, 64, device=DEVICE)
 lats  = []

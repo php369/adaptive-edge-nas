@@ -16,13 +16,13 @@ import torchvision.transforms as T
 
 warnings.filterwarnings('ignore')
 
-# ── Reproducibility ────────────────────────────────────────────────────────────
+# Set random seeds for reproducibility
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# ── GPU optimizations ──────────────────────────────────────────────────────────
+# Setup GPU optimizations
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.benchmark     = True   # fastest conv algorithms for fixed input sizes
@@ -39,7 +39,7 @@ if DEVICE.type == 'cuda':
     print(f'TF32   : matmul={torch.backends.cuda.matmul.allow_tf32}  '
           f'cudnn={torch.backends.cudnn.allow_tf32}')
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# Configure paths
 BASE_DIR      = Path.cwd()
 DATASET_DIR = Path("/raid/home/dgxuser15/datasets/tiny-imagenet-200")
 RESULTS_DIR   = BASE_DIR / 'results'
@@ -55,7 +55,7 @@ STATS_FILE = RESULTS_DIR / 'dataset_stats.json'
 
 print('Paths configured.')
 
-# ── Mean / Std ─────────────────────────────────────────────────────────────────
+# Load or set default mean and standard deviation for normalization
 if STATS_FILE.exists():
     with open(STATS_FILE) as f:
         s = json.load(f)
@@ -70,7 +70,7 @@ else:
 print(f'  mean = {MEAN}')
 print(f'  std  = {STD}')
 
-# ── Class map ──────────────────────────────────────────────────────────────────
+# Map class WordNet IDs to integer indices
 with open(WNIDS_FILE) as f:
     wnids = [l.strip() for l in f if l.strip()]
 
@@ -78,7 +78,7 @@ CLASS_MAP   = {wnid: idx for idx, wnid in enumerate(sorted(wnids))}
 NUM_CLASSES = len(CLASS_MAP)
 print(f'  #classes = {NUM_CLASSES}')
 
-# ── Transforms ─────────────────────────────────────────────────────────────────
+# Define data augmentation and transformation pipelines
 TRAIN_TRANSFORM = T.Compose([
     T.RandomCrop(64, padding=8, padding_mode='reflect'),
     T.RandomHorizontalFlip(p=0.5),
@@ -101,7 +101,7 @@ print('  TRAIN : RandomCrop(64,pad=8) | HFlip(0.5) | ColorJitter | RandomGraysca
 print('  VAL   : CenterCrop(56) → Resize(64) | Normalize')
 
 
-# ── Datasets ───────────────────────────────────────────────────────────────────
+# Define PyTorch dataset classes
 class TinyImageNetTrain(Dataset):
     """Training split — applies TRAIN_TRANSFORM."""
     def __init__(self, samples):
@@ -130,7 +130,7 @@ class TinyImageNetVal(Dataset):
         return VAL_TRANSFORM(img), label
 
 
-# ── Build sample lists ─────────────────────────────────────────────────────────
+# Build lists of samples for training and validation
 train_samples: list[tuple[Path, int]] = []
 for wnid, label in CLASS_MAP.items():
     img_dir = TRAIN_DIR / wnid / 'images'
@@ -150,7 +150,7 @@ with open(VAL_ANNOT) as f:
 print(f'Train samples : {len(train_samples):,}')
 print(f'Val   samples : {len(val_samples):,}')
 
-# ── Save manifest ──────────────────────────────────────────────────────────────
+# Save dataset manifest and summary to disk
 train_manifest = [(str(p), lbl) for p, lbl in train_samples]
 val_manifest   = [(str(p), lbl) for p, lbl in val_samples]
 
@@ -181,7 +181,7 @@ print(f'✓  Manifest saved  → {manifest_path}')
 print(f'✓  Summary saved   → {PROCESSED_DIR / "manifest_summary.json"}')
 print(json.dumps(summary, indent=2))
 
-# ── DataLoaders ────────────────────────────────────────────────────────────────
+# Initialize PyTorch DataLoaders
 BATCH_SIZE  = 256
 # FIX: use consistent worker count; leave 1 core free on i7
 NUM_WORKERS = 8
@@ -216,7 +216,7 @@ print(f'  num_workers = {NUM_WORKERS} | pin_memory = {PIN_MEMORY}')
 print(f'  batch_size  = {BATCH_SIZE}  | drop_last (train) = True')
 print(f'  train batches : {len(train_loader)} | val batches : {len(val_loader)}')
 
-# ── Augmentation preview ───────────────────────────────────────────────────────
+# Generate and save an augmentation preview image
 print('Generating augmentation preview …')
 
 N_SAMPLES = 6
@@ -249,7 +249,7 @@ fig.suptitle('Data Augmentation Preview — Training Pipeline',
 plt.savefig(RESULTS_DIR / 'augmentation_preview.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# ── DataLoader benchmark ───────────────────────────────────────────────────────
+# Benchmark DataLoader throughput
 print(f'Benchmarking DataLoader (batch={BATCH_SIZE}, 20 batches) …')
 
 loader_iter = iter(train_loader)

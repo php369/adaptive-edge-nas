@@ -20,7 +20,7 @@ import torchvision.models as tvm
 
 warnings.filterwarnings('ignore')
 
-# ── GPU optimizations (RTX 4060 / Ampere) ─────────────────────────────────────
+# Configure GPU optimizations for RTX 4060 / Ampere
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark     = True
     torch.backends.cudnn.deterministic = False
@@ -35,7 +35,7 @@ if DEVICE.type == 'cuda':
     print(f'TF32   : matmul={torch.backends.cuda.matmul.allow_tf32}  '
           f'cudnn={torch.backends.cudnn.allow_tf32}')
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# Define and create required directories
 BASE_DIR      = Path.cwd()
 PROCESSED_DIR = BASE_DIR / 'processed'
 MODELS_DIR    = BASE_DIR / 'models'
@@ -45,7 +45,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 BASELINE_NAMES = ['mobilenetv2', 'shufflenetv2', 'efficientnet_b0']
 
-# ── Load manifest ──────────────────────────────────────────────────────────────
+# Load dataset manifest created by data preprocessing script
 manifest_path = PROCESSED_DIR / 'data_manifest.pkl'
 assert manifest_path.exists(), 'Run data-preprocessing.py first!'
 
@@ -59,7 +59,7 @@ NUM_CLASSES = manifest['num_classes']
 
 print(f'Val samples : {len(val_samples):,}  |  Classes : {NUM_CLASSES}')
 
-# ── Transform + Dataset ────────────────────────────────────────────────────────
+# Define validation data transformations and dataset class
 VAL_TRANSFORM = T.Compose([
     T.CenterCrop(56),
     T.Resize(64, interpolation=T.InterpolationMode.BILINEAR, antialias=True),
@@ -95,7 +95,7 @@ def get_val_loader(batch_size: int = 256,
     )
 
 
-# ── Latency measurement ────────────────────────────────────────────────────────
+# Measure model inference latency in milliseconds
 @torch.no_grad()
 def measure_latency_ms(model: nn.Module, n_runs: int = 100,
                         use_channels_last: bool = True) -> float:
@@ -117,7 +117,7 @@ def measure_latency_ms(model: nn.Module, n_runs: int = 100,
     return float(np.median(lats))
 
 
-# ── Evaluation ─────────────────────────────────────────────────────────────────
+# Evaluate the model on the validation dataset
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader) -> dict:
     model.eval()
@@ -146,7 +146,7 @@ def evaluate(model: nn.Module, loader: DataLoader) -> dict:
     }
 
 
-# ── Quantization ───────────────────────────────────────────────────────────────
+# Perform dynamic INT8 quantization for CPU evaluation
 def quantize_model(model: nn.Module, name: str) -> nn.Module:
     """Dynamic INT8 quantization (CPU-side). Falls back gracefully on failure."""
     # quantize_dynamic requires CPU — deepcopy avoids mutating the GPU model
@@ -164,7 +164,7 @@ def quantize_model(model: nn.Module, name: str) -> nn.Module:
         return model_cpu
 
 
-# ── Pruning ────────────────────────────────────────────────────────────────────
+# Perform L1 unstructured magnitude pruning
 def prune_model(model: nn.Module, name: str, amount: float = 0.30) -> nn.Module:
     """Unstructured L1 magnitude pruning on all Conv2d layers."""
     model_pruned = copy.deepcopy(model).cpu().to(memory_format=torch.contiguous_format)
@@ -190,7 +190,7 @@ def prune_model(model: nn.Module, name: str, amount: float = 0.30) -> nn.Module:
     return model_pruned.to(DEVICE)
 
 
-# ── ONNX export + benchmark ────────────────────────────────────────────────────
+# Export model to ONNX format and benchmark using ONNXRuntime
 def export_and_benchmark_onnx(model: nn.Module, name: str, n_runs: int = 100) -> float:
     """Export to ONNX and benchmark with ONNXRuntime. Returns latency or -1."""
     try:
@@ -231,7 +231,7 @@ def export_and_benchmark_onnx(model: nn.Module, name: str, n_runs: int = 100) ->
     return lat_ms
 
 
-# ── Helper: rebuild model skeleton from name ───────────────────────────────────
+# Build empty model architecture based on string name
 def _build_skeleton(name: str) -> nn.Module:
     if name == 'mobilenetv2':
         model = tvm.mobilenet_v2(weights=None, num_classes=NUM_CLASSES)
@@ -247,7 +247,7 @@ def _build_skeleton(name: str) -> nn.Module:
     return model
 
 
-# ── Helper: strip torch.compile() prefix from state_dict keys ──────────────────
+# Helper to strip 'torch.compile()' prefixes from state dictionary keys
 def strip_compiled_prefix(state_dict: dict) -> dict:
     """
     torch.compile() wraps model internals and prefixes every key with
@@ -263,7 +263,7 @@ def strip_compiled_prefix(state_dict: dict) -> dict:
     return cleaned
 
 
-# ── Main evaluation loop ───────────────────────────────────────────────────────
+# Main evaluation loop to benchmark baseline models
 val_loader     = get_val_loader(batch_size=256, num_workers=6, pin_memory=True)
 all_model_data = []
 
@@ -324,7 +324,7 @@ for name in BASELINE_NAMES:
     if DEVICE.type == 'cuda':
         torch.cuda.empty_cache()
 
-# ── Evaluate NAS fine-tuned model (if available) ──────────────────────────────
+# Evaluate NAS fine-tuned model if available
 import torch.nn.functional as F   # needed by NAS building blocks
 
 # --- NAS search-space primitives (must match hardware-aware.py / nas.py) -----
@@ -544,7 +544,7 @@ elif nas_arch_path.exists():
         'model_size_MB': 0.0,
     })
 
-# ── Summary table ──────────────────────────────────────────────────────────────
+# Generate summary comparison table and save metrics
 print('\n' + '═' * 90)
 print(f"  {'Model':<22} {'Acc@1':>7} {'Acc@5':>7} {'Params':>8} {'FLOPs':>9} "
       f"{'Lat(ms)':>9} {'Size(MB)':>9}")
@@ -560,7 +560,7 @@ with open(out_json, 'w') as f:
     json.dump(all_model_data, f, indent=2)
 print(f'\n✓  Final comparison data → {out_json}')
 
-# ── Bar chart comparison ───────────────────────────────────────────────────────
+# Create bar chart comparison of all evaluated models
 if all_model_data:
     names   = [m['name'] for m in all_model_data]
     palette = plt.cm.Set2(np.linspace(0, 1, len(names)))
@@ -593,7 +593,7 @@ if all_model_data:
     plt.show()
     print('Saved → final_comparison.png')
 
-# ── Accuracy vs latency scatter ────────────────────────────────────────────────
+# Plot accuracy vs latency scatter graph
 if all_model_data:
     palette2 = plt.cm.tab10(np.linspace(0, 1, len(all_model_data)))
     fig, ax  = plt.subplots(figsize=(10, 7))
@@ -619,7 +619,7 @@ if all_model_data:
     plt.show()
     print('Saved → accuracy_vs_latency.png')
 
-# ── FLOPs vs latency scatter ───────────────────────────────────────────────────
+# Plot FLOPs vs latency scatter graph
 valid_flops = [m for m in all_model_data if m['flops_M'] > 0]
 if valid_flops:
     palette3 = plt.cm.Set1(np.linspace(0, 1, len(valid_flops)))
